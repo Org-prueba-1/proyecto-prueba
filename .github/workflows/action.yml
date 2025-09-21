@@ -1,0 +1,97 @@
+name: Gitlab Migration Tool Production
+on:
+  workflow_dispatch:
+
+jobs:         
+  Get-Repositories-to-Migrate:
+      runs-on: ubuntu-latest
+      outputs:
+        REPOSITORIES: ${{ steps.set-matrix.outputs.REPO }}
+
+      steps:
+        - name: Checkout to repository
+          uses: actions/checkout@v4
+
+        - name: Set matrix data
+          id: set-matrix
+          run: |
+            echo "REPO=$(awk -F',' 'NR > 1 {print $1}' repositories.csv | jq -R -c -s 'split("\n") | map(select(. != ""))')" >> $GITHUB_OUTPUT 
+        
+  Migration:
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    needs: Get-Repositories-to-Migrate
+    strategy:
+      # SET MATRIX WITH PROJECTS TO MIGRATE
+      matrix:
+        repository: ${{fromJson(needs.Get-Repositories-to-Migrate.outputs.REPOSITORIES)}}
+    env:
+      GH_PAT: ${{ secrets.GH_PAT }}
+      #GL_USERNAME: ${{ secrets.GL_USERNAME }}
+      GL_TOKEN: ${{ secrets.GL_TOKEN }}
+
+    steps:
+      - name: Checkout to repository
+        uses: actions/checkout@v4
+
+      - name: Set up organization origin
+        run: echo "ORGORIGEN=$(awk -F',' -v repo="${{ matrix.repository }}" 'NR > 1 && $1 == repo {print $2}' repositories.csv)" >> $GITHUB_ENV
+
+      - name: Set up organization target
+        run: echo "ORGTARGET=$(awk -F',' -v repo="${{ matrix.repository }}" 'NR > 1 && $1 == repo {print $3}' repositories.csv)" >> $GITHUB_ENV
+
+      - name: Set up repository target
+        run: echo "REPOTARGET=$(awk -F',' -v repo="${{ matrix.repository }}" 'NR > 1 && $1 == repo {print $4}' repositories.csv)" >> $GITHUB_ENV
+          
+      - name: Check if repository exists
+        #if: false
+        run: |
+          response=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${{ secrets.GH_PAT }}" "https://api.github.com/repos/${{ env.ORGTARGET }}/${{ matrix.repository }}")
+            # Verificar el código de respuesta
+            if [ "$response" -eq 200 ]; then
+              echo "El repositorio ${{ env.ORGTARGET }}/${{ matrix.repository }} existe."
+              exit 1
+            else
+              echo "El repositorio ${{ env.ORGTARGET }}/${{ matrix.repository }} no existe."
+            fi
+          
+      - name: Clone Gitlab Repository ${{ matrix.repository }}
+        #if: false
+        run: |
+          git clone https://ceballoscristian487:${{ secrets.GL_TOKEN }}@gitlab.com/${{ env.ORGORIGEN }}/${{ matrix.repository }}.git --mirror
+      
+      - name: Create repository on Github
+        #if: false
+        run: |
+          curl -L \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GH_PAT }}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/orgs/${{ env.ORGTARGET }}/repos \
+            -d '{"name":"${{ matrix.repository }}","private":true}'
+            
+      - name: Push repository to Github
+        continue-on-error: true
+        run: |
+          cd ${{ matrix.repository }}.git
+          git remote add github "https://${{ secrets.GH_PAT }}@github.com/${{ env.ORGTARGET }}/${{ env.REPOTARGET }}.git"
+          
+          git push github --mirror || PUSH_FAILED=true
+          
+          if [ "$PUSH_FAILED" != true ]; then
+              echo "Push successful"
+              exit 0
+          else
+              echo "Push error, trying with Git LFS"
+              git lfs migrate import --above="100 MB" --everything
+              git push github --mirror || LFS_PUSH_FAILED=true
+              if [ "$LFS_PUSH_FAILED" != true ]; then
+                  echo "Push with Git LFS successful"
+                  exit 0
+              else
+                  echo "Push with Git LFS failed"
+                  exit 1
+              fi
+          fi
+             
